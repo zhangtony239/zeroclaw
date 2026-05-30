@@ -318,12 +318,16 @@ impl ContextCompressor {
             return Ok(false);
         }
 
+        let summary_model = self.config.summary_model.as_deref().unwrap_or(model);
+        let preserve_media_markers =
+            self.config.summary_model.is_none() && model_provider.supports_vision();
+
         // Build transcript from the middle section
         let middle = &history[start..end];
         let transcript = build_summarizer_transcript(
             middle,
             self.config.source_max_chars,
-            model_provider.supports_vision(),
+            preserve_media_markers,
         );
 
         if transcript.is_empty() {
@@ -331,7 +335,6 @@ impl ContextCompressor {
         }
 
         let message_count = end - start;
-        let summary_model = self.config.summary_model.as_deref().unwrap_or(model);
 
         let identifier_note = if self.config.identifier_policy == "strict" {
             "\nIMPORTANT: Preserve all identifiers exactly as they appear."
@@ -414,9 +417,7 @@ impl ContextCompressor {
         }
 
         // Splice: head + [SUMMARY] + tail
-        let summary_msg = ChatMessage::assistant(format!(
-            "[CONTEXT SUMMARY \u{2014} {message_count} earlier messages compressed]\n\n{summary}"
-        ));
+        let summary_msg = build_summary_message(&history[start..end], &summary, message_count);
         history.splice(start..end, std::iter::once(summary_msg));
 
         // Repair orphaned tool pairs
@@ -515,30 +516,25 @@ fn repair_tool_pairs(messages: &mut Vec<ChatMessage>) {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn build_transcript(messages: &[ChatMessage], max_chars: usize) -> String {
+fn build_full_transcript(messages: &[ChatMessage]) -> String {
     let mut transcript = String::new();
     for msg in messages {
         let role = msg.role.to_uppercase();
         let _ = writeln!(transcript, "{role}: {}", msg.content.trim());
     }
-
-    if transcript.len() > max_chars {
-        truncate_chars(&transcript, max_chars)
-    } else {
-        transcript
-    }
+    transcript
 }
 
 fn build_summarizer_transcript(
     messages: &[ChatMessage],
     max_chars: usize,
-    supports_vision: bool,
+    preserve_media_markers: bool,
 ) -> String {
-    let transcript = build_transcript(messages, max_chars);
-    if supports_vision {
+    let transcript = build_full_transcript(messages);
+    if preserve_media_markers {
         // Vision-capable summarizer can read media markers; preserve them so
         // visual content is reflected in the summary (per #6189 contract).
-        return transcript;
+        return truncate_owned_if_needed(transcript, max_chars);
     }
 
     // Non-vision summarizer cannot consume media markers. Strip ALL inbound
@@ -546,7 +542,15 @@ fn build_summarizer_transcript(
     // AUDIO — case-insensitive) instead of just `[IMAGE:...]`, otherwise a
     // local filesystem path can leak into the auxiliary `chat_with_system`
     // payload and the upstream API rejects it as a malformed `image_url.url`.
-    multimodal::strip_media_markers(&transcript)
+    truncate_owned_if_needed(multimodal::strip_media_markers(&transcript), max_chars)
+}
+
+fn truncate_owned_if_needed(s: String, max: usize) -> String {
+    if s.len() > max {
+        truncate_chars(&s, max)
+    } else {
+        s
+    }
 }
 
 fn truncate_chars(s: &str, max: usize) -> String {
@@ -561,6 +565,46 @@ fn truncate_chars(s: &str, max: usize) -> String {
     let mut result = s[..end].to_string();
     result.push_str("...");
     result
+}
+
+/// Construct the synthesized assistant message that replaces a compressed
+/// range. When the compressed range contains an assistant turn with
+/// `reasoning_content` (a thinking-mode response from providers like
+/// DeepSeek V4), embed the most recent such payload in the summary as a
+/// JSON-encoded `{content, reasoning_content}` body — matching the shape
+/// `build_native_assistant_history` already produces — so the next request
+/// to the provider passes its reasoning round-trip check. See #6269.
+fn build_summary_message(
+    compressed: &[ChatMessage],
+    summary: &str,
+    message_count: usize,
+) -> ChatMessage {
+    let summary_text = format!(
+        "[CONTEXT SUMMARY \u{2014} {message_count} earlier messages compressed]\n\n{summary}"
+    );
+
+    let last_reasoning = compressed
+        .iter()
+        .rev()
+        .filter(|m| m.role == "assistant")
+        .find_map(|m| {
+            serde_json::from_str::<serde_json::Value>(&m.content)
+                .ok()
+                .and_then(|v| {
+                    v.get("reasoning_content")
+                        .and_then(|rc| rc.as_str().map(ToString::to_string))
+                })
+        });
+
+    if let Some(rc) = last_reasoning {
+        let payload = serde_json::json!({
+            "content": summary_text,
+            "reasoning_content": rc,
+        });
+        ChatMessage::assistant(payload.to_string())
+    } else {
+        ChatMessage::assistant(summary_text)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -772,7 +816,7 @@ mod tests {
     #[test]
     fn test_build_transcript() {
         let messages = vec![msg("user", "hello"), msg("assistant", "hi there")];
-        let t = build_transcript(&messages, 10_000);
+        let t = build_full_transcript(&messages);
         assert!(t.contains("USER: hello"));
         assert!(t.contains("ASSISTANT: hi there"));
     }
@@ -815,9 +859,36 @@ mod tests {
     }
 
     #[test]
+    fn test_build_summarizer_transcript_strips_media_markers_before_truncation() {
+        let long_path = format!(
+            "/private/tmp/zeroclaw/signal_inbound/{}",
+            "nested-directory/".repeat(12)
+        );
+        let messages = vec![msg(
+            "user",
+            &format!("Please summarize [IMAGE:{long_path}photo.png] after text"),
+        )];
+
+        let transcript = build_summarizer_transcript(&messages, 64, false);
+
+        assert!(
+            !transcript.contains("[IMAGE:"),
+            "non-vision transcript should not retain a split image marker: {transcript}"
+        );
+        assert!(
+            !transcript.contains("/private/tmp"),
+            "non-vision transcript should not leak local path fragments: {transcript}"
+        );
+        assert!(
+            transcript.contains("[media attachment]"),
+            "non-vision transcript should preserve an attachment placeholder: {transcript}"
+        );
+    }
+
+    #[test]
     fn test_build_transcript_truncates() {
         let messages = vec![msg("user", &"x".repeat(1000))];
-        let t = build_transcript(&messages, 100);
+        let t = truncate_owned_if_needed(build_full_transcript(&messages), 100);
         assert!(t.len() <= 103); // 100 + "..."
     }
 
@@ -909,6 +980,39 @@ mod tests {
         let prompt = seen.last().expect("summarizer should be invoked");
         assert!(!prompt.contains("[IMAGE:"));
         assert!(!prompt.contains("/tmp/example.png"));
+    }
+
+    #[tokio::test]
+    async fn compress_if_needed_strips_image_markers_when_summary_model_overrides() {
+        let config = ContextCompressionConfig {
+            protect_first_n: 1,
+            protect_last_n: 1,
+            threshold_ratio: 0.01,
+            summary_model: Some("text-summary-model".to_string()),
+            ..Default::default()
+        };
+        let compressor = ContextCompressor::new(config, 64);
+        let model_provider = CaptureSummarizerModelProvider {
+            supports_vision: true,
+            seen_messages: Mutex::new(Vec::new()),
+        };
+        let mut history = vec![
+            msg("system", "sys"),
+            msg("user", "Earlier question [IMAGE:/tmp/summary-override.png]"),
+            msg("assistant", "Earlier answer"),
+            msg("user", "Newest question"),
+        ];
+
+        let result = compressor
+            .compress_if_needed(&mut history, &model_provider, "default-vision-model", None)
+            .await
+            .expect("compression should succeed");
+
+        assert!(result.compressed);
+        let seen = model_provider.seen_messages.lock();
+        let prompt = seen.last().expect("summarizer should be invoked");
+        assert!(!prompt.contains("[IMAGE:"));
+        assert!(!prompt.contains("/tmp/summary-override.png"));
     }
 
     // ── fast_trim_tool_results tests ────────────────────────────────
@@ -1021,5 +1125,90 @@ mod tests {
         let mut history = vec![msg("tool", &big)];
         let saved = compressor.fast_trim_tool_results(&mut history);
         assert_eq!(saved, 0);
+    }
+
+    /// When the compressed range has no thinking-mode reasoning_content,
+    /// the synthesized summary is plain text — same as before #6269.
+    #[test]
+    fn build_summary_message_uses_plain_text_when_no_reasoning() {
+        let compressed = vec![
+            msg("user", "what's the weather"),
+            msg("assistant", "it's sunny"),
+        ];
+        let out = build_summary_message(&compressed, "weather chat", 2);
+        assert_eq!(out.role, "assistant");
+        assert!(out.content.starts_with("[CONTEXT SUMMARY"));
+        assert!(out.content.contains("weather chat"));
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&out.content).is_err(),
+            "plain-text summary must not parse as JSON"
+        );
+    }
+
+    /// Regression test for #6269 — when an assistant message in the
+    /// compressed range carries `reasoning_content` (thinking-mode replay
+    /// payload), the synthesized summary preserves it via JSON-encoded
+    /// content matching `build_native_assistant_history`'s shape.
+    /// Without this, providers that require reasoning round-trip
+    /// (DeepSeek V4 thinking) reject every post-compression request.
+    #[test]
+    fn build_summary_message_preserves_reasoning_content_when_present() {
+        let assistant_with_reasoning = serde_json::json!({
+            "content": "let me look",
+            "reasoning_content": "user wants weather; need to check",
+        })
+        .to_string();
+        let compressed = vec![
+            msg("user", "what's the weather"),
+            msg("assistant", &assistant_with_reasoning),
+        ];
+
+        let out = build_summary_message(&compressed, "weather chat", 2);
+        assert_eq!(out.role, "assistant");
+        let parsed: serde_json::Value = serde_json::from_str(&out.content)
+            .expect("summary must be JSON when reasoning_content is preserved");
+        assert!(
+            parsed["content"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("[CONTEXT SUMMARY")),
+            "summary text belongs in `content`",
+        );
+        assert_eq!(
+            parsed["reasoning_content"].as_str(),
+            Some("user wants weather; need to check"),
+            "must carry reasoning_content from the most recent compressed assistant turn",
+        );
+    }
+
+    /// When multiple compressed assistant turns have reasoning_content,
+    /// the most recent one survives — this matches DeepSeek's protocol
+    /// expectation that the *immediately prior* assistant turn's
+    /// reasoning is what gets replayed.
+    #[test]
+    fn build_summary_message_picks_last_reasoning_content() {
+        let earlier = serde_json::json!({
+            "content": "first answer",
+            "reasoning_content": "EARLIER reasoning",
+        })
+        .to_string();
+        let later = serde_json::json!({
+            "content": "second answer",
+            "reasoning_content": "LATER reasoning",
+        })
+        .to_string();
+        let compressed = vec![
+            msg("user", "q1"),
+            msg("assistant", &earlier),
+            msg("user", "q2"),
+            msg("assistant", &later),
+        ];
+
+        let out = build_summary_message(&compressed, "two-turn chat", 4);
+        let parsed: serde_json::Value = serde_json::from_str(&out.content).unwrap();
+        assert_eq!(
+            parsed["reasoning_content"].as_str(),
+            Some("LATER reasoning"),
+            "must pick the most recent reasoning_content, not the earliest",
+        );
     }
 }

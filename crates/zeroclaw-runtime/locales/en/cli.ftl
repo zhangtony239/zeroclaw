@@ -129,6 +129,7 @@ cli-memory-list-about = List memory entries with optional filters
 cli-memory-get-about = Get a specific memory entry by key
 cli-memory-stats-about = Show memory backend statistics and health
 cli-memory-clear-about = Clear memories by category, by key, or clear all
+cli-memory-clear-unsupported-backend = memory clear is unsupported for append-only backend '{$backend}'; switch to a deletable backend (sqlite, lucid, or postgres)
 
 cli-estop-status-about = Print current estop status
 cli-estop-resume-about = Resume from an engaged estop level
@@ -382,3 +383,15 @@ channel-wecom-ws-dm-access-denied =
     Your userid: {$userid}
 
     Ask an administrator to add your userid to {$allowed_users_path}.
+
+# Onboarding — OpenAI auth picker
+onboard-openai-auth-note =
+    OpenAI authentication:
+    • API key — standard API access via platform.openai.com (sk-...)
+    • Codex subscription — uses your ChatGPT Plus/Pro account (no API key needed)
+onboard-openai-auth-prompt = Authentication
+onboard-openai-auth-api-key = API key
+onboard-openai-auth-codex = Codex subscription
+onboard-openai-codex-followup =
+    Codex subscription auth uses your ChatGPT account.
+    Run `zeroclaw auth login --provider openai-codex` to authenticate before starting your agent.

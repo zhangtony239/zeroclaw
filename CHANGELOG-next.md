@@ -17,6 +17,37 @@ v0.8.0 turns ZeroClaw from a single-agent daemon into a true multi-agent host. O
 
 ## What's New
 
+### Added
+
+- **agents**: Added `[agents.<alias>].classifier_provider` (`ModelProviderRef`)
+  to route the reply-intent classifier (`classify_channel_reply_intent`) to a
+  separate, cheaper provider/model than the main answering model. Empty (default)
+  preserves pre-release behavior: the classifier reuses the main agent's
+  `model_provider`. Non-empty values must reference a configured
+  `[providers.models.<type>.<alias>]` entry (validated at config-load fail-loud
+  through the same `typed_provider_refs` check that covers `tts_provider` and
+  `transcription_provider`). ACP channels skip the classifier entirely and
+  are unaffected.
+
+  Example: route classification through a free fast model while answering
+  with the premium model:
+
+      [providers.models.custom.default]
+      api_key  = "..."
+      model    = "qwen3.6-plus"
+      uri      = "https://coding.dashscope.aliyuncs.com/v1"
+      wire_api = "chat_completions"
+
+      [providers.models.custom.kimi-k2-5]    # alias may NOT contain '.';
+      api_key  = "..."                       # write 'kimi-k2-5' not 'kimi-k2.5'
+      model    = "kimi-k2.5"                 # the model string CAN contain '.'
+      uri      = "https://coding.dashscope.aliyuncs.com/v1"
+      wire_api = "chat_completions"
+
+      [agents.default]
+      model_provider      = "custom.default"
+      classifier_provider = "custom.kimi-k2-5"
+
 ### Multi-Agent & Runtime
 
 The multi-agent epic (#6272) is the spine of this release:
@@ -54,6 +85,21 @@ The multi-agent epic (#6272) is the spine of this release:
 - MiniMax split into Global and China picker entries (#6758); llama.cpp promoted to a dedicated provider kind (#6417).
 - OpenRouter prompt caching (#6008); Codex native Responses tool calls (#6117); Ollama `num_ctx`/`num_predict`/`temperature` tuning (#6178).
 - Trait-driven provider dispatch with OAuth refresh on the per-alias schema; Azure rewired to typed config (and `AZURE_OPENAI_*` env vars retired); `models.dev` keys pre-populate the model picker.
+- **Anthropic / Bedrock:** opt-in native extended thinking with `budget_tokens`
+  and signed thinking-block round-trip across multi-turn tool use (#5652).
+  Disabled by default — set `agent.thinking.native_thinking = true` to enable.
+  When on, preserves the signed block bytes returned by the model (no trimming)
+  so subsequent tool-use turns validate on the provider side; streaming with
+  native thinking transparently falls back to a non-streaming request and
+  carries the signed block through to conversation history via the stream's
+  `reasoning` channel. Fixed-budget native thinking is gated off for Opus 4.7
+  on both providers (which only supports adaptive thinking and rejects fixed
+  `budget_tokens` with 400) — those models stay on prompt-based reasoning
+  until adaptive thinking lands as a follow-up. Custom `budget_tokens`
+  overrides are clamped to the provider's documented `[MIN, MAX]` range with
+  a WARN, avoiding a 400 when a config value dips below the provider minimum.
+  Full `thinking_delta` / `signature_delta` SSE handling remains a follow-up
+  for token-by-token streaming of thinking text.
 
 ### Channels
 

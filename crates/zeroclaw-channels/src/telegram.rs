@@ -653,7 +653,7 @@ impl TelegramChannel {
             let mut cfg = config.write();
             if !cfg.channels.telegram.contains_key(&self.alias) {
                 anyhow::bail!(
-                    "Missing [channels.telegram.{}] section. Run `zeroclaw onboard --channels-only` first",
+                    "Missing [channels.telegram.{}] section. Run `zeroclaw onboard channels` first",
                     self.alias
                 );
             }
@@ -1654,6 +1654,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             thread_ts: thread_id,
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         })
     }
 
@@ -1822,6 +1823,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             thread_ts: thread_id,
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         })
     }
 
@@ -2044,6 +2046,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             thread_ts: thread_id,
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         })
     }
 

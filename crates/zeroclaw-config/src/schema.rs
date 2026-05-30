@@ -471,6 +471,11 @@ pub struct Config {
     #[nested]
     pub image_gen: ImageGenConfig,
 
+    /// Standalone file upload tool configuration (`[file_upload]`).
+    #[serde(default)]
+    #[nested]
+    pub file_upload: FileUploadConfig,
+
     /// Plugin system configuration (`[plugins]`).
     #[serde(default)]
     #[nested]
@@ -637,6 +642,12 @@ pub struct ModelProviderConfig {
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+    /// Provider implementation to instantiate for this profile. Use this
+    /// when a canonical typed slot should run through a compatible
+    /// implementation, e.g. `[providers.models.openai.proxy] kind =
+    /// "openai-compatible"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
     /// Endpoint URI the client hits. Override the family's default endpoint when pointing at a self-hosted gateway (LiteLLM, vLLM, Ollama), a custom proxy, or any non-standard URL. Leave unset to use the family's default URI from its `ModelEndpoint` impl. Set this to the FULL endpoint URL — there is no separate path-suffix field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uri: Option<String>,
@@ -1669,7 +1680,7 @@ pub enum SiliconflowEndpoint {
 impl ModelEndpoint for SiliconflowEndpoint {
     fn uri(&self) -> &'static str {
         match self {
-            Self::Default => "https://api.siliconflow.cn/v1",
+            Self::Default => "https://api.siliconflow.com/v1",
         }
     }
 }
@@ -2776,6 +2787,33 @@ pub struct AliasedAgentConfig {
     #[serde(default)]
     pub transcription_provider: crate::providers::TranscriptionProviderRef,
 
+    /// Optional override for the per-message LLM reply-intent classifier
+    /// (`classify_channel_reply_intent` in zeroclaw-channels). When non-empty,
+    /// the channel orchestrator routes the "should this message be replied to?"
+    /// classification call to `[providers.models.<type>.<alias>]` referenced
+    /// here, instead of reusing the main agent's `model_provider`.
+    ///
+    /// Source of truth for api_key / uri / model / temperature etc. is the
+    /// referenced `[providers.models.<type>.<alias>]` entry. This field is
+    /// a reference only (NEVER a copy) — per AGENTS.md SINGLE SOURCE OF TRUTH.
+    ///
+    /// Empty (`Default`) = inherit the main agent's resolved provider+model
+    /// (preserves pre-PR behavior; backward compatible).
+    ///
+    /// Use case: classification is a cheap REPLY/NO_REPLY decision, doesn't
+    /// need a high-end model. Point this at a fast/free small model
+    /// (e.g. `kimi-k2.5`, `qwen-turbo`) while `model_provider` stays on the
+    /// expensive answering model (e.g. `qwen3.6-plus`).
+    ///
+    /// Note: TOML table names cannot contain `.`, so alias `kimi-k2.5`
+    /// must be written as `[providers.models.custom.kimi-k2-5]`. The
+    /// underlying `model = "kimi-k2.5"` string can still contain dots.
+    ///
+    /// ACP channels (IDE-direct) always reply and skip the classifier
+    /// entirely — this field has no effect on ACP traffic.
+    #[serde(default)]
+    pub classifier_provider: crate::providers::ModelProviderRef,
+
     // ── Agent loop / runtime tunables (folded from `[agent]` ──────
     // These are per-agent. Defaults preserve the legacy single-agent
     // behavior so an unconfigured agent runs identically to a config
@@ -2908,6 +2946,7 @@ impl Default for AliasedAgentConfig {
             cron_jobs: Vec::new(),
             tts_provider: crate::providers::TtsProviderRef::default(),
             transcription_provider: crate::providers::TranscriptionProviderRef::default(),
+            classifier_provider: crate::providers::ModelProviderRef::default(),
             compact_context: default_agent_compact_context(),
             max_tool_iterations: default_agent_max_tool_iterations(),
             max_history_messages: default_agent_max_history_messages(),
@@ -3236,8 +3275,9 @@ impl Config {
     /// Resolve the runtime-active agent alias the orchestrator binds
     /// channels to. Mirrors the same selection logic as
     /// `start_channels()` in zeroclaw-channels: prefer the migration-
-    /// synthesized `"default"` agent, fall back to the first enabled
-    /// agent. Returns `None` only when no agent is configured at all.
+    /// synthesized `"default"` agent, otherwise fall back to the
+    /// lexicographically-smallest enabled alias. Returns `None` only
+    /// when no enabled agent is configured.
     ///
     /// Used by per-agent infrastructure (TtsManager, TranscriptionManager)
     /// to pick which agent's `tts_provider` / `transcription_provider`
@@ -3249,13 +3289,14 @@ impl Config {
         self.agents
             .keys()
             .find(|k| k.as_str() == "default")
+            .map(String::as_str)
             .or_else(|| {
                 self.agents
                     .iter()
-                    .find(|(_, a)| a.enabled)
-                    .map(|(alias, _)| alias)
+                    .filter(|(_, a)| a.enabled)
+                    .map(|(alias, _)| alias.as_str())
+                    .min()
             })
-            .map(String::as_str)
     }
 
     /// Resolve the active storage backend for the memory subsystem.
@@ -3641,8 +3682,11 @@ pub struct McpServerConfig {
     /// Optional environment variables for stdio transport.
     #[serde(default)]
     pub env: HashMap<String, String>,
-    /// Optional HTTP headers for HTTP/SSE transports.
+    /// Optional HTTP headers for HTTP/SSE transports. Treated as secret —
+    /// the values commonly carry Bearer tokens for the upstream MCP server.
     #[serde(default)]
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub headers: HashMap<String, String>,
     /// Optional per-call timeout in seconds (hard capped in validation).
     #[serde(default)]
@@ -6817,6 +6861,77 @@ impl Default for ImageGenConfig {
             enabled: false,
             default_model: default_image_gen_model(),
             api_key_env: default_image_gen_api_key_env(),
+        }
+    }
+}
+
+// ── File Upload ─────────────────────────────────────────────────
+
+/// Standalone file upload tool configuration (`[file_upload]`).
+///
+/// When `url` is set to a non-empty value, registers a `file_upload` tool that
+/// POSTs files from the agent's local filesystem to the configured endpoint
+/// using `multipart/form-data`. The LLM provides only a file path; the host
+/// reads the bytes and uploads them without ever including file content in
+/// the model context.
+///
+/// When `url` is `None` or empty, the tool is not registered.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "file-upload"]
+pub struct FileUploadConfig {
+    /// Upload endpoint URL. Tool is disabled when this is `None` or empty.
+    #[serde(default)]
+    pub url: Option<String>,
+
+    /// HTTP method. Only `POST` (default) and `PUT` are accepted.
+    #[serde(default = "default_file_upload_method")]
+    pub method: String,
+
+    /// Multipart form-field name for the file part. Default: `file`.
+    #[serde(default = "default_file_upload_field_name")]
+    pub field_name: String,
+
+    /// Maximum file size in bytes. Larger files are rejected before any
+    /// bytes hit the network. Default: 25 MiB.
+    #[serde(default = "default_file_upload_max_size_bytes")]
+    pub max_file_size_bytes: u64,
+
+    /// Request timeout in seconds. Default: 60.
+    #[serde(default = "default_file_upload_timeout_secs")]
+    pub timeout_secs: u64,
+
+    /// Static HTTP headers attached to every upload request. Same shape as
+    /// `[mcp.servers.*.headers]`.
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+}
+
+fn default_file_upload_method() -> String {
+    "POST".into()
+}
+
+fn default_file_upload_field_name() -> String {
+    "file".into()
+}
+
+fn default_file_upload_max_size_bytes() -> u64 {
+    25 * 1024 * 1024
+}
+
+fn default_file_upload_timeout_secs() -> u64 {
+    60
+}
+
+impl Default for FileUploadConfig {
+    fn default() -> Self {
+        Self {
+            url: None,
+            method: default_file_upload_method(),
+            field_name: default_file_upload_field_name(),
+            max_file_size_bytes: default_file_upload_max_size_bytes(),
+            timeout_secs: default_file_upload_timeout_secs(),
+            headers: HashMap::new(),
         }
     }
 }
@@ -10583,6 +10698,8 @@ pub struct WebhookConfig {
     pub send_method: Option<String>,
     /// Optional `Authorization` header value for outbound requests.
     #[serde(default)]
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub auth_header: Option<String>,
     /// Optional shared secret for webhook signature verification (HMAC-SHA256).
     #[secret]
@@ -10593,6 +10710,19 @@ pub struct WebhookConfig {
     /// are not exposed to the model when responding via this channel.
     #[serde(default)]
     pub excluded_tools: Vec<String>,
+
+    /// Maximum number of retry attempts for outbound sends on transient failures
+    /// (network errors, 429, 5xx). Set to `0` to disable retries. Default: `3`.
+    #[serde(default)]
+    pub max_retries: Option<u32>,
+    /// Base delay in milliseconds for exponential backoff between retries. Default: `500`.
+    /// Values below `1` are clamped to `1ms` at runtime to avoid busy-retry loops.
+    #[serde(default)]
+    pub retry_base_delay_ms: Option<u64>,
+    /// Maximum delay cap in milliseconds for any single retry wait. Default: `30000` (30s).
+    /// Values below `1` are clamped to `1ms` at runtime to avoid busy-retry loops.
+    #[serde(default)]
+    pub retry_max_delay_ms: Option<u64>,
 }
 
 impl ChannelConfig for WebhookConfig {
@@ -12895,6 +13025,7 @@ impl Default for Config {
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
             image_gen: ImageGenConfig::default(),
+            file_upload: FileUploadConfig::default(),
             plugins: PluginsConfig::default(),
             locale: None,
             verifiable_intent: VerifiableIntentConfig::default(),
@@ -13300,6 +13431,22 @@ fn is_local_ollama_endpoint(api_url: Option<&str>) -> bool {
         .ok()
         .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
         .is_some_and(|host| matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1" | "0.0.0.0"))
+}
+
+fn is_official_ollama_cloud_endpoint(api_url: Option<&str>) -> bool {
+    let Some(raw) = api_url.map(str::trim).filter(|value| !value.is_empty()) else {
+        return false;
+    };
+
+    reqwest::Url::parse(raw)
+        .ok()
+        .and_then(|url| {
+            url.host_str().map(|host| {
+                host.eq_ignore_ascii_case("ollama.com")
+                    || host.eq_ignore_ascii_case("api.ollama.com")
+            })
+        })
+        .unwrap_or(false)
 }
 
 fn has_ollama_cloud_credential(config_api_key: Option<&str>) -> bool {
@@ -14187,27 +14334,26 @@ impl Config {
         }
 
         // Ollama cloud-routing safety checks
-        if let Some(entry) = self
-            .providers
-            .models
-            .ollama
-            .values()
-            .next()
-            .map(|cfg| &cfg.base)
-            .filter(|e| {
-                e.model
-                    .as_deref()
-                    .is_some_and(|m| m.trim().ends_with(":cloud"))
-            })
-        {
+        for (alias, cfg) in &self.providers.models.ollama {
+            let entry = &cfg.base;
+            if !entry
+                .model
+                .as_deref()
+                .is_some_and(|model| model.trim().ends_with(":cloud"))
+            {
+                continue;
+            }
+
             if is_local_ollama_endpoint(entry.uri.as_deref()) {
                 anyhow::bail!(
-                    "default_model uses ':cloud' with model_provider 'ollama', but uri is local or unset. Set uri to a remote Ollama endpoint (for example https://ollama.com)."
+                    "providers.models.ollama.{alias}.model uses ':cloud', but uri is local or unset. Set uri to a remote Ollama endpoint (for example https://ollama.com)."
                 );
             }
-            if !has_ollama_cloud_credential(entry.api_key.as_deref()) {
+            if is_official_ollama_cloud_endpoint(entry.uri.as_deref())
+                && !has_ollama_cloud_credential(entry.api_key.as_deref())
+            {
                 anyhow::bail!(
-                    "default_model uses ':cloud' with model_provider 'ollama', but no API key is configured. Set api_key on [providers.models.ollama.<alias>] (or via the schema-mirror grammar: ZEROCLAW_providers__models__ollama__<alias>__api_key=<value>)."
+                    "providers.models.ollama.{alias}.model uses ':cloud', but no API key is configured. Set api_key on [providers.models.ollama.{alias}] (or via the schema-mirror grammar: ZEROCLAW_providers__models__ollama__{alias}__api_key=<value>)."
                 );
             }
         }
@@ -14685,6 +14831,12 @@ impl Config {
                     "providers.transcription",
                     "transcription_provider",
                     agent.transcription_provider.trim(),
+                ),
+                // NEW in this PR (kanmars.req.20260522.001):
+                (
+                    "providers.models",
+                    "classifier_provider",
+                    agent.classifier_provider.trim(),
                 ),
             ];
             for (section_prefix, field, value) in typed_provider_refs {
@@ -15805,7 +15957,24 @@ enabled = true
         assert!(a.workspace_only);
         assert!(a.allowed_commands.contains(&"git".to_string()));
         assert!(a.allowed_commands.contains(&"cargo".to_string()));
-        assert!(a.forbidden_paths.contains(&"/etc".to_string()));
+        assert!(
+            !a.forbidden_paths.is_empty(),
+            "default forbidden_paths must not be empty"
+        );
+        #[cfg(not(target_os = "windows"))]
+        assert!(
+            a.forbidden_paths.iter().any(|p| p == "/etc"),
+            "Default forbidden_paths must include /etc on Unix"
+        );
+        #[cfg(target_os = "windows")]
+        assert!(
+            a.forbidden_paths.iter().any(|p| p == "C:\\Windows"),
+            "Default forbidden_paths must include C:\\Windows on Windows"
+        );
+        assert!(
+            a.forbidden_paths.contains(&"~/.ssh".to_string()),
+            "Default forbidden_paths must include ~/.ssh"
+        );
         assert!(a.require_approval_for_medium_risk);
         assert!(a.block_high_risk_commands);
         assert!(a.shell_env_passthrough.is_empty());
@@ -16298,6 +16467,7 @@ auto_save = true
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
             image_gen: ImageGenConfig::default(),
+            file_upload: FileUploadConfig::default(),
             plugins: PluginsConfig::default(),
             locale: None,
             verifiable_intent: VerifiableIntentConfig::default(),
@@ -16895,6 +17065,7 @@ default_temperature = 0.7
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
             image_gen: ImageGenConfig::default(),
+            file_upload: FileUploadConfig::default(),
             plugins: PluginsConfig::default(),
             locale: None,
             verifiable_intent: VerifiableIntentConfig::default(),
@@ -17010,6 +17181,33 @@ default_temperature = 0.7
             },
         );
 
+        // Webhook channel: auth_header carries a Bearer token; must be
+        // encrypted alongside the existing webhook `secret` field.
+        config.channels.webhook.insert(
+            "primary".into(),
+            WebhookConfig {
+                enabled: true,
+                port: 8080,
+                auth_header: Some("Bearer webhook-cred".into()),
+                secret: Some("webhook-shared-secret".into()),
+                ..Default::default()
+            },
+        );
+
+        // MCP server: HTTP headers map carries an Authorization Bearer
+        // token; the new `#[secret]` on `HashMap<String, String>` must
+        // encrypt every value (and only every value — keys stay plain).
+        config.mcp.servers.push(McpServerConfig {
+            name: "primary".into(),
+            transport: McpTransport::Sse,
+            url: Some("https://mcp.example.invalid/sse".into()),
+            headers: HashMap::from([
+                ("Authorization".to_string(), "Bearer mcp-cred".to_string()),
+                ("X-Tenant".to_string(), "tenant-42".to_string()),
+            ]),
+            ..Default::default()
+        });
+
         config.save().await.unwrap();
 
         let contents = tokio::fs::read_to_string(config.config_path.clone())
@@ -17109,6 +17307,42 @@ default_temperature = 0.7
                 .unwrap(),
             "feishu-verify"
         );
+
+        // Webhook auth_header — newly tagged `#[secret]`.
+        let webhook = stored.channels.webhook.get("primary").unwrap();
+        let webhook_auth = webhook.auth_header.as_deref().unwrap();
+        assert!(
+            crate::secrets::SecretStore::is_encrypted(webhook_auth),
+            "webhook auth_header must be encrypted on save"
+        );
+        assert_eq!(store.decrypt(webhook_auth).unwrap(), "Bearer webhook-cred");
+        // The pre-existing webhook `secret` field stays encrypted too —
+        // sanity check that the refactor didn't regress it.
+        let webhook_secret = webhook.secret.as_deref().unwrap();
+        assert!(crate::secrets::SecretStore::is_encrypted(webhook_secret));
+        assert_eq!(
+            store.decrypt(webhook_secret).unwrap(),
+            "webhook-shared-secret"
+        );
+
+        // MCP server headers — every value must be encrypted; the keys
+        // stay plaintext (TOML table headers are not secret).
+        let mcp_server = stored
+            .mcp
+            .servers
+            .iter()
+            .find(|s| s.name == "primary")
+            .expect("mcp server `primary` round-trips through save");
+        for (key, value) in &mcp_server.headers {
+            assert!(
+                crate::secrets::SecretStore::is_encrypted(value),
+                "mcp.servers.primary.headers.{key} must be encrypted on save"
+            );
+        }
+        let auth = mcp_server.headers.get("Authorization").unwrap();
+        let tenant = mcp_server.headers.get("X-Tenant").unwrap();
+        assert_eq!(store.decrypt(auth).unwrap(), "Bearer mcp-cred");
+        assert_eq!(store.decrypt(tenant).unwrap(), "tenant-42");
 
         let _ = fs::remove_dir_all(&dir).await;
     }
@@ -17666,6 +17900,44 @@ bot_token = "xoxb-tok"
         assert_eq!(parsed.port, 8080);
     }
 
+    #[test]
+    async fn webhook_config_retry_fields_default_to_none() {
+        let json = r#"{"port":8080}"#;
+        let parsed: WebhookConfig = serde_json::from_str(json).unwrap();
+        assert!(parsed.max_retries.is_none());
+        assert!(parsed.retry_base_delay_ms.is_none());
+        assert!(parsed.retry_max_delay_ms.is_none());
+    }
+
+    #[test]
+    async fn webhook_config_retry_fields_roundtrip() {
+        let wc = WebhookConfig {
+            enabled: true,
+            port: 8080,
+            listen_path: None,
+            send_url: Some("https://example.com/cb".into()),
+            send_method: None,
+            auth_header: None,
+            secret: None,
+            excluded_tools: vec![],
+            max_retries: Some(5),
+            retry_base_delay_ms: Some(250),
+            retry_max_delay_ms: Some(10_000),
+        };
+
+        let json = serde_json::to_string(&wc).unwrap();
+        let parsed: WebhookConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.max_retries, Some(5));
+        assert_eq!(parsed.retry_base_delay_ms, Some(250));
+        assert_eq!(parsed.retry_max_delay_ms, Some(10_000));
+
+        let toml_str = toml::to_string(&wc).unwrap();
+        let parsed: WebhookConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.max_retries, Some(5));
+        assert_eq!(parsed.retry_base_delay_ms, Some(250));
+        assert_eq!(parsed.retry_max_delay_ms, Some(10_000));
+    }
+
     // ── WhatsApp config ──────────────────────────────────────
 
     #[test]
@@ -18003,13 +18275,31 @@ default_temperature = 0.7
         let a = RiskProfileConfig::default();
         assert!(a.workspace_only, "Default profile must be workspace_only");
         assert!(
-            a.forbidden_paths.contains(&"/etc".to_string()),
-            "Must block /etc"
+            !a.forbidden_paths.is_empty(),
+            "Default forbidden_paths must not be empty"
         );
-        assert!(
-            a.forbidden_paths.contains(&"/proc".to_string()),
-            "Must block /proc"
-        );
+        #[cfg(not(target_os = "windows"))]
+        {
+            assert!(
+                a.forbidden_paths.iter().any(|p| p == "/etc"),
+                "Must block /etc on Unix"
+            );
+            assert!(
+                a.forbidden_paths.iter().any(|p| p == "/proc"),
+                "Must block /proc on Unix"
+            );
+        }
+        #[cfg(target_os = "windows")]
+        {
+            assert!(
+                a.forbidden_paths.iter().any(|p| p == "C:\\Windows"),
+                "Must block C:\\Windows on Windows"
+            );
+            assert!(
+                a.forbidden_paths.iter().any(|p| p == "C:\\Program Files"),
+                "Must block C:\\Program Files on Windows"
+            );
+        }
         assert!(
             a.forbidden_paths.contains(&"~/.ssh".to_string()),
             "Must block ~/.ssh"
@@ -18472,7 +18762,51 @@ model = "primary-model"
 
         let error = config.validate().expect_err("expected validation to fail");
         assert!(error.to_string().contains(
-            "default_model uses ':cloud' with model_provider 'ollama', but uri is local or unset"
+            "providers.models.ollama.default.model uses ':cloud', but uri is local or unset"
+        ));
+    }
+
+    #[test]
+    async fn validate_ollama_cloud_model_accepts_private_remote_without_api_key() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+        config.providers.models.ollama.insert(
+            "default".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("glm-5:cloud".to_string()),
+                    uri: Some("http://192.168.1.100:11434".to_string()),
+                    api_key: None,
+                    ..Default::default()
+                },
+                ..OllamaModelProviderConfig::default()
+            },
+        );
+
+        let result = config.validate();
+        assert!(result.is_ok(), "expected validation to pass: {result:?}");
+    }
+
+    #[test]
+    async fn validate_ollama_cloud_model_requires_api_key_for_official_endpoint() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+        config.providers.models.ollama.insert(
+            "default".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("glm-5:cloud".to_string()),
+                    uri: Some("https://ollama.com/api".to_string()),
+                    api_key: None,
+                    ..Default::default()
+                },
+                ..OllamaModelProviderConfig::default()
+            },
+        );
+
+        let error = config.validate().expect_err("expected validation to fail");
+        assert!(error.to_string().contains(
+            "providers.models.ollama.default.model uses ':cloud', but no API key is configured"
         ));
     }
 
@@ -18497,6 +18831,40 @@ model = "primary-model"
 
         let result = config.validate();
         assert!(result.is_ok(), "expected validation to pass: {result:?}");
+    }
+
+    #[test]
+    async fn validate_ollama_cloud_model_checks_each_alias_for_official_key() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+        config.providers.models.ollama.insert(
+            "local".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("llama3".to_string()),
+                    uri: Some("http://192.168.1.100:11434".to_string()),
+                    ..Default::default()
+                },
+                ..OllamaModelProviderConfig::default()
+            },
+        );
+        config.providers.models.ollama.insert(
+            "cloud".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("glm-5:cloud".to_string()),
+                    uri: Some("https://ollama.com/api".to_string()),
+                    api_key: None,
+                    ..Default::default()
+                },
+                ..OllamaModelProviderConfig::default()
+            },
+        );
+
+        let error = config.validate().expect_err("expected validation to fail");
+        assert!(error.to_string().contains(
+            "providers.models.ollama.cloud.model uses ':cloud', but no API key is configured"
+        ));
     }
 
     #[test]
@@ -22152,5 +22520,106 @@ allowed_users = []
         config
             .validate()
             .expect("two-member same-channel peer group must validate cleanly");
+    }
+
+    #[test]
+    async fn config_validate_rejects_classifier_provider_pointing_at_missing_alias() {
+        // Use the SHARED `typed_provider_refs` validation loop — same error
+        // surface as tts_provider / transcription_provider.
+        let toml = r#"
+            [providers.models.custom.default]
+            api_key = "k"
+            model = "qwen3.6-plus"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+
+            [risk_profiles.default]
+            level = "supervised"
+
+            [agents.default]
+            enabled = true
+            model_provider = "custom.default"
+            risk_profile = "default"
+            classifier_provider = "custom.does-not-exist"
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let err = cfg
+            .validate()
+            .expect_err("missing alias must fail validate");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("classifier_provider")
+                && msg.contains("does-not-exist")
+                && msg.contains("providers.models.custom.does-not-exist is not configured"),
+            "expected DanglingReference error mentioning field + alias + section, got: {msg}"
+        );
+    }
+
+    #[test]
+    async fn config_validate_accepts_classifier_provider_pointing_at_existing_alias() {
+        let toml = r#"
+            [providers.models.custom.default]
+            api_key = "k1"
+            model = "qwen3.6-plus"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+
+            [providers.models.custom.kimi-k2-5]
+            api_key = "k2"
+            model = "kimi-k2.5"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+
+            [risk_profiles.default]
+            level = "supervised"
+
+            [agents.default]
+            enabled = true
+            model_provider = "custom.default"
+            risk_profile = "default"
+            classifier_provider = "custom.kimi-k2-5"
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        cfg.validate()
+            .expect("validate must succeed for resolvable ref");
+        assert_eq!(
+            cfg.agents
+                .get("default")
+                .unwrap()
+                .classifier_provider
+                .as_str(),
+            "custom.kimi-k2-5"
+        );
+    }
+
+    #[test]
+    async fn config_validate_accepts_empty_classifier_provider_as_inheritance_signal() {
+        // No classifier_provider field at all → must validate, must remain
+        // the empty default. This pins backward compatibility.
+        let toml = r#"
+            [providers.models.custom.default]
+            api_key = "k"
+            model = "qwen3.6-plus"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+
+            [risk_profiles.default]
+            level = "supervised"
+
+            [agents.default]
+            enabled = true
+            model_provider = "custom.default"
+            risk_profile = "default"
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        cfg.validate()
+            .expect("missing classifier_provider must validate");
+        assert!(
+            cfg.agents
+                .get("default")
+                .unwrap()
+                .classifier_provider
+                .is_empty()
+        );
     }
 }
