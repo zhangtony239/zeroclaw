@@ -91,32 +91,39 @@ These 7 constraints from AGENTS.md are non-negotiable. A PR that violates one
 should be flagged.
 
 ### 5.1 Single static binary
+
 The project ships as a single static binary. Flag changes that introduce
 mandatory runtime dependencies, require external services for core
 functionality, or cause significant binary size growth without proportional
 value.
 
 ### 5.2 Trait-driven pluggability
+
 All extension points use traits. Flag changes that bypass or hardcode around
 trait boundaries.
 
 ### 5.3 Minimal footprint
+
 Target is <5 MB binary, minimal RAM/CPU. Flag changes that add significant
 overhead (heavy dependencies, unbounded caches, expensive default paths).
 
 ### 5.4 Runs on anything (RPi Zero hardware floor)
+
 Must run on edge targets including Raspberry Pi Zero. Flag changes that
 require hardware or OS features unavailable on constrained devices.
 
 ### 5.5 Secure by default
+
 Deny-by-default security posture. Flag changes that weaken security policy,
 broaden the attack surface, or add default-allow rules.
 
 ### 5.6 No vendor lock-in
+
 No provider gets privilege outside the trait boundary. Flag changes that
 grant special treatment to a specific vendor or provider.
 
 ### 5.7 Zero external infrastructure
+
 Core functionality must work without third-party services. Flag changes that
 make an external service a hard dependency for core features.
 
