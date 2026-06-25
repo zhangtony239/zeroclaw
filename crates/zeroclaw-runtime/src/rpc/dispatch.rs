@@ -3961,8 +3961,9 @@ mod tests {
         let (mut dispatcher, mut write_rx) = make_response_frame_test_dispatcher();
         let rpc = Arc::clone(&dispatcher.rpc);
 
-        let pending =
-            tokio::spawn(async move { rpc.request("client/ping", json!({"ping": true})).await });
+        let pending = zeroclaw_spawn::spawn!(async move {
+            rpc.request("client/ping", json!({"ping": true})).await
+        });
 
         let outbound = tokio::time::timeout(std::time::Duration::from_secs(1), write_rx.recv())
             .await
@@ -4000,7 +4001,8 @@ mod tests {
         let (mut dispatcher, mut write_rx) = make_response_frame_test_dispatcher();
         let rpc = Arc::clone(&dispatcher.rpc);
 
-        let pending = tokio::spawn(async move { rpc.request("client/fail", json!({})).await });
+        let pending =
+            zeroclaw_spawn::spawn!(async move { rpc.request("client/fail", json!({})).await });
 
         let outbound = tokio::time::timeout(std::time::Duration::from_secs(1), write_rx.recv())
             .await
