@@ -28,8 +28,8 @@ TUI_BIN_NAME="zerocode"
 
 # Apps installed by default (the rest are discovered and listed but off
 # until selected via --apps or the interactive picker). Intentionally a
-# fixed list: zeroclaw-desktop needs the Tauri toolchain + webview deps,
-# so it ships off-by-default.
+# fixed list: Tauri-based apps need the Tauri toolchain + webview deps,
+# so they ship off-by-default.
 DEFAULT_APPS="zerocode"
 
 # ── Parse Cargo.toml (source of truth) ────────────────────────────
@@ -92,9 +92,9 @@ expand_default_features() {
 # `cargo install --path apps/<dir>` — they are NOT cargo features of the
 # main binary. The installable set is discovered from `apps/*/Cargo.toml`
 # so adding an app surfaces here without editing this script. `zerocode`
-# (the TUI) is the default app. Tauri-based apps (e.g. zeroclaw-desktop)
-# need the Tauri toolchain + system webview deps and are excluded from the
-# simple `cargo install` path.
+# (the TUI) is the default app. Tauri-based apps need the Tauri toolchain
+# + system webview deps and are excluded from the simple `cargo install`
+# path.
 discover_apps() {
   APPS=""
   for dir in apps/*/; do
@@ -241,7 +241,18 @@ detect_target_triple() {
   arch=$(uname -m)
 
   case "$os" in
-  Darwin) echo "aarch64-apple-darwin" ;; # presume M-series
+  Darwin)
+    # Apple Silicon reports arm64; Intel reports x86_64. A Rosetta-translated
+    # shell on Apple Silicon also reports x86_64 from `uname -m`, so consult
+    # `sysctl hw.optional.arm64` to recover the true CPU. Without this an Intel
+    # Mac (or an M-series Mac run under Rosetta) is handed the wrong-arch
+    # binary and hits "bad CPU type in executable".
+    if [ "$arch" = "arm64" ] || [ "$(sysctl -n hw.optional.arm64 2>/dev/null)" = "1" ]; then
+      echo "aarch64-apple-darwin"
+    else
+      echo "x86_64-apple-darwin"
+    fi
+    ;;
   Linux)
     libc=$(detect_libc)
     case "$arch" in
@@ -284,8 +295,8 @@ install_prebuilt() {
   printf "%s\n" "$(bold "Installing ZeroClaw ${version} (pre-built)")"
   info "Platform: $triple"
   info "Source:   $asset_url"
-  info "Channels: pre-built binaries use the lean default bundle."
-  info "For Slack/Discord or all bundled channels, build from source with --preset full."
+  info "Channels: pre-built binaries ship the full distribution channel set (all channels, no heavyweight extras)."
+  info "For heavyweight extras excluded from the distribution set (e.g. whatsapp-web), build from source with --preset full."
   echo
 
   # Resolve platform-correct web data directory to match gateway auto-detect
@@ -302,14 +313,11 @@ install_prebuilt() {
   tmp_dir=$(mktemp -d)
   trap 'rm -rf "$tmp_dir"' EXIT
 
-  curl -fSL --progress-bar "$asset_url" -o "$tmp_dir/$asset_name" ||
-    {
-      warn "Download failed — falling back to source build"
-      rm -rf "$tmp_dir"
-      return 1
-    }
-
-  # Verify checksum — all failure modes fall back to source rather than install unverified
+  # Fetch the checksum manifest first — it lists every published asset, so we
+  # can tell "no pre-built binary for this platform" (e.g. Intel macOS, which
+  # ships no release tarball) from a genuine download failure, and we never
+  # pull a tarball we couldn't verify anyway. All failure modes fall back to
+  # source rather than install unverified.
   if ! curl -fsSL "$sha256_url" -o "$tmp_dir/SHA256SUMS" 2>/dev/null; then
     warn "Could not fetch SHA256SUMS — falling back to source build"
     rm -rf "$tmp_dir"
@@ -318,10 +326,17 @@ install_prebuilt() {
 
   expected=$(grep "$asset_name" "$tmp_dir/SHA256SUMS" | awk '{print $1}')
   if [ -z "$expected" ]; then
-    warn "Asset not found in SHA256SUMS — falling back to source build"
+    warn "No pre-built binary published for $triple — falling back to source build"
     rm -rf "$tmp_dir"
     return 1
   fi
+
+  curl -fSL --progress-bar "$asset_url" -o "$tmp_dir/$asset_name" ||
+    {
+      warn "Download failed — falling back to source build"
+      rm -rf "$tmp_dir"
+      return 1
+    }
 
   if command -v sha256sum >/dev/null 2>&1; then
     actual=$(sha256sum "$tmp_dir/$asset_name" | awk '{print $1}')
@@ -369,7 +384,8 @@ Options:
   --prebuilt           Download and install a pre-built binary (default when asked)
   --source             Build from source (skips the pre-built prompt)
   --preset NAME        Named feature preset: 'minimal' (kernel only, ~6.6MB) or
-                       'full' (historical broad channel bundle). Source builds only.
+                       'full' (every channel plus heavyweight extras such as
+                       whatsapp-web and channel-matrix). Source builds only.
   --minimal            Alias for --preset minimal
   --features X,Y       Select specific features — source only (comma-separated)
   --apps X,Y           Select apps to install (e.g. zerocode); "none" to skip all
@@ -393,7 +409,7 @@ Examples:
   $0 --source                                  # always build from source
   $0 --source --minimal                        # smallest possible binary
   $0 --source --features agent-runtime,channel-discord  # custom feature set
-  $0 --source --preset full                   # broad channel bundle
+  $0 --source --preset full                   # every channel plus heavyweight extras
   $0 --skip-quickstart                            # install only, configure later
   $0 --prefix /tmp/zc-test --skip-quickstart      # isolated test install
   $0 --dry-run --prebuilt                      # preview without installing
@@ -983,6 +999,22 @@ See all available features:
     esac
   fi
 
+  # `--preset full` must actually deliver the broad bundle the installer
+  # advertises (whatsapp-web, channel-matrix, the heavyweight extras), not
+  # Cargo's lean `default`. Resolve the explicit feature list from the
+  # canonical registry (`cargo generate features --selection all`), the same
+  # source of truth the release workflow consumes, and build with
+  # --no-default-features against it so the advertised set is exact.
+  if [ "$PRESET" = "full" ]; then
+    preset_features=$(cargo run --quiet -p xtask --bin generate -- features --selection all 2>/dev/null || true)
+    if [ -n "$preset_features" ]; then
+      CARGO_FLAGS="--no-default-features"
+      USER_FEATURES="${USER_FEATURES:+$USER_FEATURES,}$preset_features"
+    else
+      warn "Could not resolve --preset full from the feature registry; falling back to default features."
+    fi
+  fi
+
   # Interactive picker — only when the operator did not pin features or
   # apps via the CLI and is running under a TTY. Skipped on `--minimal`,
   # `--preset`, `--features`, `--apps`, `--with-gateway` /
@@ -1050,7 +1082,7 @@ See all available features:
       fi
     fi
     if [ "$PRESET" = "full" ] && [ "$DRY_RUN" != true ] && [ -t 1 ]; then
-      info "--preset full: building from source with the historical broad channel bundle."
+      info "--preset full: building from source with the complete feature set (every channel plus heavyweight extras) resolved from the registry."
     fi
   fi
 
