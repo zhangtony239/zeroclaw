@@ -4,6 +4,8 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 
+use super::constants::{SKILL_DEPRECATED_MANIFESTS, SKILL_MANIFEST_FILENAME};
+
 const MAX_TEXT_FILE_BYTES: u64 = 512 * 1024;
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -36,25 +38,31 @@ pub fn audit_skill_directory_with_options(
     options: SkillAuditOptions,
 ) -> Result<SkillAuditReport> {
     if !skill_dir.exists() {
-        bail!("Skill source does not exist: {}", skill_dir.display());
+        bail!(
+            "Skill source does not exist: {}",
+            skill_dir.display().to_string()
+        );
     }
     if !skill_dir.is_dir() {
-        bail!("Skill source must be a directory: {}", skill_dir.display());
+        bail!(
+            "Skill source must be a directory: {}",
+            skill_dir.display().to_string()
+        );
     }
 
     let canonical_root = skill_dir
         .canonicalize()
-        .with_context(|| format!("failed to canonicalize {}", skill_dir.display()))?;
+        .with_context(|| format!("failed to canonicalize {}", skill_dir.display().to_string()))?;
     let mut report = SkillAuditReport::default();
 
-    let has_manifest = canonical_root.join("SKILL.md").is_file()
-        || canonical_root.join("SKILL.toml").is_file()
-        || canonical_root.join("manifest.toml").is_file();
-    if !has_manifest {
-        report.findings.push(
-            "Skill root must include SKILL.md, SKILL.toml, or manifest.toml for deterministic auditing."
-                .to_string(),
-        );
+    let has_canonical = canonical_root.join(SKILL_MANIFEST_FILENAME).is_file();
+    let has_deprecated = SKILL_DEPRECATED_MANIFESTS
+        .iter()
+        .any(|name| canonical_root.join(name).is_file());
+    if !has_canonical && !has_deprecated {
+        report.findings.push(format!(
+            "Skill root must include {SKILL_MANIFEST_FILENAME} (canonical) or one of {SKILL_DEPRECATED_MANIFESTS:?} (deprecated) for deterministic auditing.",
+        ));
     }
 
     for path in collect_paths_depth_first(&canonical_root)? {
@@ -67,14 +75,17 @@ pub fn audit_skill_directory_with_options(
 
 pub fn audit_open_skill_markdown(path: &Path, repo_root: &Path) -> Result<SkillAuditReport> {
     if !path.exists() {
-        bail!("Open-skill markdown not found: {}", path.display());
+        bail!(
+            "Open-skill markdown not found: {}",
+            path.display().to_string()
+        );
     }
     let canonical_repo = repo_root
         .canonicalize()
-        .with_context(|| format!("failed to canonicalize {}", repo_root.display()))?;
+        .with_context(|| format!("failed to canonicalize {}", repo_root.display().to_string()))?;
     let canonical_path = path
         .canonicalize()
-        .with_context(|| format!("failed to canonicalize {}", path.display()))?;
+        .with_context(|| format!("failed to canonicalize {}", path.display().to_string()))?;
     if !canonical_path.starts_with(&canonical_repo) {
         bail!(
             "Open-skill markdown escapes repository root: {}",
@@ -102,9 +113,9 @@ fn collect_paths_depth_first(root: &Path) -> Result<Vec<PathBuf>> {
         }
 
         let mut children = Vec::new();
-        for entry in fs::read_dir(&current)
-            .with_context(|| format!("failed to read directory {}", current.display()))?
-        {
+        for entry in fs::read_dir(&current).with_context(|| {
+            format!("failed to read directory {}", current.display().to_string())
+        })? {
             let entry = entry?;
             children.push(entry.path());
         }
@@ -125,7 +136,7 @@ fn audit_path(
     options: SkillAuditOptions,
 ) -> Result<()> {
     let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("failed to read metadata for {}", path.display()))?;
+        .with_context(|| format!("failed to read metadata for {}", path.display().to_string()))?;
     let rel = relative_display(root, path);
 
     if metadata.file_type().is_symlink() {
@@ -162,8 +173,12 @@ fn audit_path(
 }
 
 fn audit_markdown_file(root: &Path, path: &Path, report: &mut SkillAuditReport) -> Result<()> {
-    let content = fs::read_to_string(path)
-        .with_context(|| format!("failed to read markdown file {}", path.display()))?;
+    let content = fs::read_to_string(path).with_context(|| {
+        format!(
+            "failed to read markdown file {}",
+            path.display().to_string()
+        )
+    })?;
 
     for raw_target in extract_markdown_links(&content) {
         audit_markdown_link_target(root, path, &raw_target, report);
@@ -173,8 +188,12 @@ fn audit_markdown_file(root: &Path, path: &Path, report: &mut SkillAuditReport) 
 }
 
 fn audit_manifest_file(root: &Path, path: &Path, report: &mut SkillAuditReport) -> Result<()> {
-    let content = fs::read_to_string(path)
-        .with_context(|| format!("failed to read TOML manifest {}", path.display()))?;
+    let content = fs::read_to_string(path).with_context(|| {
+        format!(
+            "failed to read TOML manifest {}",
+            path.display().to_string()
+        )
+    })?;
     let rel = relative_display(root, path);
     let parsed: toml::Value = match toml::from_str(&content) {
         Ok(value) => value,
@@ -228,11 +247,13 @@ fn audit_markdown_link_target(
 
     if let Some(scheme) = url_scheme(normalized) {
         if matches!(scheme, "http" | "https" | "mailto") {
-            if has_markdown_suffix(normalized) {
-                report.findings.push(format!(
-                    "{rel}: remote markdown links are blocked by skill security audit ({normalized})."
-                ));
-            }
+            // Remote documentation links are passed through as prompt text; the
+            // loader never fetches them at audit/load time, and any later fetch
+            // stays governed by normal tool/network policy. A `.md` suffix does
+            // not reliably indicate Markdown content (many docs sites serve HTML
+            // at `.md` routes), so flagging these was a false positive that
+            // silently degraded legitimate skills. Structural checks below still
+            // reject other schemes (e.g. `javascript:`/`file:`). See #6714.
             return;
         }
 
@@ -824,6 +845,57 @@ EOF\"\"\"
         assert!(
             is_cross_skill_reference("../../escape.md"),
             "double parent should still be cross-skill"
+        );
+    }
+
+    #[test]
+    fn audit_allows_remote_markdown_documentation_links() {
+        // Regression for #6714: remote http/https/mailto links that happen to
+        // end in `.md`/`.markdown` are documentation references, not fetched at
+        // load time, so they must not be flagged. Real skills (e.g. Cloudinary,
+        // Sanity) cite many such URLs.
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("remote-docs");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "# Skill\n\
+             See [transforms](https://cloudinary.com/documentation/transformation_reference.md)\n\
+             and [schema guide](http://example.com/docs/schema.markdown)\n\
+             or email [support](mailto:support@example.com).\n",
+        )
+        .unwrap();
+
+        let report = audit_skill_directory(&skill_dir).unwrap();
+        assert!(report.is_clean(), "{:#?}", report.findings);
+    }
+
+    #[test]
+    fn audit_still_rejects_unsupported_url_schemes() {
+        // The structural scheme check must survive the #6714 cleanup: only
+        // http/https/mailto pass through; other schemes (javascript:, file:)
+        // are still rejected.
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("bad-scheme");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "# Skill\n\
+             Click [here](javascript:alert(1))\n\
+             or open [local](file:///etc/passwd.md)\n",
+        )
+        .unwrap();
+
+        let report = audit_skill_directory(&skill_dir).unwrap();
+        assert_eq!(
+            report
+                .findings
+                .iter()
+                .filter(|finding| finding.contains("unsupported URL scheme in markdown link"))
+                .count(),
+            2,
+            "{:#?}",
+            report.findings
         );
     }
 }

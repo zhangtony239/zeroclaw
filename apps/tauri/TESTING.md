@@ -1,97 +1,93 @@
 # Desktop app — testing notes
 
+## Startup flow
+
+The desktop app is a thin shell over a running ZeroClaw **web gateway**. There
+is no longer a macOS/Windows/Linux permission-setup wizard — the app goes
+straight to the gateway, and first-time setup happens in the web Quickstart.
+
+On launch:
+
+1. A small **splash** window (`apps/tauri/splash/index.html`) appears and polls
+   the gateway's `/health` (via the `get_health` IPC command) every ~1.2s.
+2. Once the gateway is healthy, the splash calls the `open_dashboard` command,
+   which pairs with the gateway (when pairing is required), creates the **main**
+   window pointed at the gateway **root** (`http://127.0.0.1:42617/`), seeds the
+   bearer token via an initialization script, and closes the splash.
+3. The web app's fresh-install redirect (`FreshInstallRedirect` in
+   `web/src/App.tsx`) sends first-time users — no agents yet, Quickstart never
+   completed — to `/quickstart`. Returning users land on the dashboard.
+
+> The app assumes a gateway is reachable on `127.0.0.1:42617`. It does **not**
+> start the gateway itself yet — bundling the gateway as a Tauri sidecar is the
+> planned "full experience" distribution (architecture RFC fnd-001, D5).
+>
+> **Run `zeroclaw daemon`, not `zeroclaw gateway start`.** Both serve the
+> dashboard on 42617, but only the daemon attaches the supervisor that powers
+> in-place reload. After the Quickstart applies config it calls `/admin/reload`;
+> a standalone `gateway start` has no supervisor and returns
+> `503 "no daemon supervisor — running as standalone gateway"`, so the new agent
+> won't go live until the process is restarted. The daemon hot-reloads instead.
+
 ## macOS (current target)
 
 ### Reset to fresh-install state
 ```sh
 pkill -f 'target/debug/zeroclaw-desktop'
 rm "$HOME/Library/Application Support/ai.zeroclawlabs.desktop/settings.json"
-tccutil reset All ai.zeroclawlabs.desktop      # for installed .app only — see notes
 killall Dock                                   # if dock icon looks stale
 bash dev/run-tauri-dev.sh
 ```
 
-`tccutil reset` only matches by bundle id, which is set on the `.app`, not the dev binary. For real fresh-permission tests, build the `.app` first:
+To exercise the full first-run path, also reset the gateway's config so the
+Quickstart auto-launches (the gateway reports `quickstart_completed=false` and
+an empty agents list via `GET /api/quickstart/state`).
+
+For a real installed-bundle test:
 ```sh
 cd apps/tauri && cargo tauri build
 cp -R target/release/bundle/macos/ZeroClaw.app /Applications/
 xattr -dr com.apple.quarantine /Applications/ZeroClaw.app
-tccutil reset All ai.zeroclawlabs.desktop
 open /Applications/ZeroClaw.app
 ```
 
-### What to verify in the wizard
-- 8 steps render with progress dots
-- Each Grant button either opens the right System Settings pane (deep-link via `x-apple.systempreferences:`) or fires the native macOS prompt (Screen Recording, Microphone, Camera, Input Monitoring)
-- Status pills flip to Granted within 2s of toggling in System Settings (driven by the 2s polling loop in `onboarding/index.html`)
-- "Start ZeroClaw" closes onboarding, opens the main dashboard window pointed at the gateway, and fires `POST /api/devices/me/capabilities` (best-effort)
-- Quit + relaunch → wizard does not reappear; only the tray icon
+### What to verify
+- With **no gateway running**: splash shows "Connecting to your ZeroClaw
+  gateway…" and, after a few seconds, the "make sure the gateway is running"
+  hint. The tray icon shows Disconnected.
+- Start the daemon (`cargo run -p zeroclaw -- daemon`, or `zeroclaw daemon`):
+  within ~1–2s the splash hands off — the dashboard window opens, splash closes.
+- **First run** (fresh gateway config): the dashboard opens straight onto the
+  **Quickstart**; completing it configures an agent and the gateway becomes
+  usable. After completion, relaunching the app lands on the dashboard.
+- **Returning run** (agent already configured): the dashboard opens on the
+  normal dashboard, not the Quickstart.
+- Quit from the tray → relaunch → splash → dashboard again (tray icon persists
+  in the menu bar).
 
-### Known macOS-only pieces
-- `apps/tauri/src/macos/permissions.rs` is `#[cfg(target_os = "macos")]`
-- IOKit (`IOHIDCheckAccess`) for Input Monitoring
-- `ApplicationServices.framework` (`AXIsProcessTrusted`) for Accessibility
-- `CoreGraphics.framework` (`CGRequestScreenCaptureAccess`) for Screen Recording
-- Swift CLI bridges (`swift -e`) for AVFoundation, UNUserNotificationCenter, SFSpeechRecognizer
-- `osascript` bridge for Automation
-- `open x-apple.systempreferences:...?Privacy_*` for deep-linking
+### Agent capabilities still present (not part of setup)
+- `take_screenshot` (gated by the Screen Recording TCC check in
+  `apps/tauri/src/macos/permissions.rs::check_screen_recording`)
+- `run_applescript` (gated by the Automation TCC prompt)
 
-## Linux (NOT YET IMPLEMENTED — tracked in #6501)
+These are invoked by the agent/dashboard at runtime; macOS shows its own native
+permission prompt the first time each is used. There is no in-app wizard for
+them anymore.
 
-### What works today
-- App builds (cfg gates skip macOS-only code)
-- Tauri shell, windows, tray, app icon (`icon.png`), bundle as `.deb`/`.AppImage`
-- Onboarding wizard renders
+## Linux / Windows
 
-### What does NOT work today
-- Every permission reports a stub "granted" status — wizard becomes 8 click-throughs of no-ops
-- No real permission gates exist on most Linux setups; some are gated by:
-  - **xdg-desktop-portal** (Wayland) — for screen capture, file picker, etc.
-  - **PipeWire/PulseAudio** — for mic/camera (just device access, no prompt)
-  - **D-Bus + libnotify** — for notifications (no permission gate)
-  - **AT-SPI** for accessibility — open, no permission concept
+The app builds and runs the same splash → gateway → Quickstart flow. Bundle
+targets are unchanged (`.deb`/`.AppImage` on Linux, `.exe`/`.msi` on Windows).
+Screen capture and AppleScript capabilities remain macOS-only; the other
+platforms simply don't register them.
 
-### What to test once #6501 lands
-- Fresh `.deb` install on Ubuntu 22.04+ → onboarding shows simplified flow → tray works
-- Fresh `.AppImage` on Fedora/Arch → same
-- xdg-desktop-portal screen capture prompt fires once on Wayland
-- Notification appears via D-Bus
-
-### How to attempt a build today (will compile, won't be useful)
+### How to build
 ```sh
 cd apps/tauri
-cargo build --release --target x86_64-unknown-linux-gnu   # needs cross toolchain
-# Or build natively on a Linux box:
-cargo tauri build
-```
-
-## Windows (NOT YET IMPLEMENTED — tracked in #6501)
-
-### What works today
-- App builds (cfg gates skip macOS-only code)
-- Tauri shell, windows, system tray, app icon (`icon.ico`), bundle as `.exe`/`.msi`
-- Onboarding wizard renders
-
-### What does NOT work today
-- Same stub "granted" problem as Linux
-- Windows permissions live in:
-  - **App manifest** (UWP capability declarations) — required at build time for mic/camera
-  - **Settings → Privacy** (system-wide app permissions)
-  - **Action Center** for notifications (no permission gate)
-  - **Admin elevation** for low-level keyboard hooks (Input Monitoring equivalent)
-
-### What to test once #6501 lands
-- Fresh `.msi` install on Windows 11 → onboarding shows simplified flow → system tray works
-- Mic/camera consent dialog fires from Privacy panel
-- Notifications appear in Action Center
-- Admin-elevation prompt for global keyboard hook
-
-### How to attempt a build today (will compile, won't be useful)
-```sh
-cd apps/tauri
-cargo build --release --target x86_64-pc-windows-msvc     # needs cross toolchain
-# Or build natively on Windows:
-cargo tauri build
+cargo tauri build          # native build on each platform
+# Or cross-compile with the appropriate target + toolchain:
+#   cargo build --release --target x86_64-unknown-linux-gnu
+#   cargo build --release --target x86_64-pc-windows-msvc
 ```
 
 ## CI matrix to add (separate issue)
@@ -101,19 +97,3 @@ cargo tauri build
 matrix:
   os: [macos-14, ubuntu-22.04, windows-2022]
 ```
-
-## Capability sync end-to-end test (gateway-side)
-
-Today the gateway's `POST /api/devices/me/capabilities` is implemented in this branch but the running gateway behind the SSH tunnel is an older build. To verify capabilities actually land in the DB:
-
-```sh
-# Run a local gateway from this branch
-cargo run -p zeroclaw -- gateway
-
-# In another terminal, walk the wizard, click "Start ZeroClaw"
-# Then query the local devices.db (path depends on workspace config):
-sqlite3 <workspace>/devices.db "SELECT id, capabilities FROM devices;"
-# Expected: one row with a JSON array of granted permission names.
-```
-
-When the production gateway is rebuilt from this branch, the same query against the VPS DB will show the production Mac's capabilities.
