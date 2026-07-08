@@ -1,0 +1,164 @@
+name: Package Android (armv7)
+
+# Packages a release archive for the Android armv7 target
+# (`armv7-linux-androideabi`). Targeted at the v0.7.5 line.
+#
+# Mirrors the Android handling in release-stable-manual.yml's
+# `aarch64-linux-android` job, plus the explicit NDK toolchain pin needed
+# because armv7's NDK wrapper is named `armv7a-linux-androideabi<API>-clang`
+# while `cc-rs` (ring / aws-lc-sys) derives `arm-linux-androideabi-clang`
+# from the target triple and fails to find it. aarch64-linux-android doesn't
+# hit this because its derived name matches the NDK wrapper by luck.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  # wa-rs crates don't compile for Android; exclude whatsapp-web (same as
+  # release-stable-manual.yml's aarch64-linux-android cargo_features override).
+  CARGO_FEATURES: channel-matrix,channel-lark
+
+jobs:
+  web:
+    name: Build Web Dashboard
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.93.0
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Build web dashboard
+        # `cargo web build` is the xtask wrapper that:
+        # 1. renders the gateway's OpenAPI 3.1 spec in-process,
+        # 2. runs `npx openapi-typescript` to produce
+        #    `web/src/lib/api-generated.ts` (gitignored — never
+        #    committed since #4f60f4405),
+        # 3. runs `npm ci` + `npm run build` (tsc + vite).
+        # Plain `cd web && npm run build` skips step 1+2 and tsc
+        # fails on the missing import.
+        run: cargo web build
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: web-dist
+          path: web/dist/
+          retention-days: 1
+
+  package:
+    name: Package armv7-linux-androideabi
+    needs: [web]
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.93.0
+          targets: armv7-linux-androideabi
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          prefix-key: ubuntu-latest-armv7-linux-androideabi
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: web-dist
+          path: web/dist/
+
+      - name: Setup Android NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Resolve the NDK prebuilt dir for the runner arch (x86_64 or aarch64).
+          case "$(uname -m)" in
+            x86_64) NDK_HOST="linux-x86_64" ;;
+            aarch64) NDK_HOST="linux-aarch64" ;;
+            *)
+              echo "Unsupported runner architecture: $(uname -m)" >&2
+              exit 1
+              ;;
+          esac
+          NDK_PREBUILT="$ANDROID_NDK/toolchains/llvm/prebuilt/$NDK_HOST"
+          if [ ! -d "$NDK_PREBUILT" ]; then
+            echo "::error::Android NDK prebuilt directory not found: $NDK_PREBUILT" >&2
+            exit 1
+          fi
+          echo "$NDK_PREBUILT/bin" >> "$GITHUB_PATH"
+
+          # armv7 NDK wrapper naming differs from the Rust target triple:
+          # the toolchain ships `armv7a-linux-androideabi<API>-clang`, but
+          # `cc-rs` (used by ring / aws-lc-sys) derives `arm-linux-androideabi-clang`
+          # from the `armv7-linux-androideabi` target and fails to find it.
+          # Pin to API 24 (covers ~99% of Android devices) and point the
+          # cc-rs env vars at the real binaries. aarch64-linux-android doesn't
+          # hit this because its derived name matches the NDK wrapper by luck.
+          API="24"
+          CLANG="${NDK_PREBUILT}/bin/armv7a-linux-androideabi${API}-clang"
+          CLANGXX="${NDK_PREBUILT}/bin/armv7a-linux-androideabi${API}-clang++"
+          AR="${NDK_PREBUILT}/bin/llvm-ar"
+          RANLIB="${NDK_PREBUILT}/bin/llvm-ranlib"
+          for tool in "$CLANG" "$CLANGXX" "$AR" "$RANLIB"; do
+            if [ ! -x "$tool" ]; then
+              echo "::error::NDK tool not found or not executable: $tool" >&2
+              echo "--- available armv7a wrappers ---" >&2
+              ls -1 "${NDK_PREBUILT}/bin" | grep -E 'armv7a-linux-androideabi' >&2 || true
+              exit 1
+            fi
+          done
+          {
+            echo "CC_armv7_linux_androideabi=${CLANG}"
+            echo "CXX_armv7_linux_androideabi=${CLANGXX}"
+            echo "AR_armv7_linux_androideabi=${AR}"
+            echo "RANLIB_armv7_linux_androideabi=${RANLIB}"
+            echo "CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER=${CLANG}"
+          } >> "$GITHUB_ENV"
+          echo "Pinned armv7 NDK toolchain (API ${API}):"
+          echo "  CC  = ${CLANG}"
+          echo "  CXX = ${CLANGXX}"
+          echo "  AR  = ${AR}"
+          echo "  RANLIB = ${RANLIB}"
+
+      - name: Build release
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build \
+            --release \
+            --locked \
+            --features "${CARGO_FEATURES}" \
+            --target armv7-linux-androideabi
+
+      - name: Check binary size
+        shell: bash
+        run: bash scripts/ci/check_binary_size.sh "target/armv7-linux-androideabi/release/zeroclaw" "armv7-linux-androideabi"
+        env:
+          BINARY_SIZE_HARD_LIMIT: "52428800" # 50MB — release builds include all optional features
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p staging/web
+          cp target/armv7-linux-androideabi/release/zeroclaw staging/
+          cp -r web/dist staging/web/dist
+          cd staging
+          tar czf ../zeroclaw-armv7-linux-androideabi.tar.gz zeroclaw web/dist
+          cd ..
+          ls -lh zeroclaw-armv7-linux-androideabi.tar.gz
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: zeroclaw-armv7-linux-androideabi
+          path: zeroclaw-armv7-linux-androideabi.tar.gz
+          if-no-files-found: error
+          retention-days: 14
